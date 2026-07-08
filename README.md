@@ -142,7 +142,7 @@ User Input (Topic + Date)
 ### 1. Clone & set up environment
 
 ```bash
-git clone "https://github.com/Raman7072/Blog_writing_agent"
+git clone "https://github.com/Raman7072/InkGraph"
 cd "blog writing agent"
 
 python -m venv .venv
