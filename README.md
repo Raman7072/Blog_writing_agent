@@ -1,4 +1,4 @@
-![GraphLoom Logo](images/graphloom_logo.png)
+![GraphLoom Logo](styles/images/logo.png)
 
 > **An Autonomous, Multi-Agent Technical Blog Generation Engine Powered by LangGraph, Groq and Streamlit.**
 
@@ -216,7 +216,7 @@ Open your browser at `http://localhost:8501` to access GraphLoom.
 
 | Real-Time Telemetry Stream | Generated Article & Diagrams |
 | :---: | :---: |
-| ![Telemetry Interface](images/ss1.png) | ![Markdown & Visual Preview](images/ss2.png) |
+| ![Telemetry Interface](styles/images/ss1.png) | ![Markdown & Visual Preview](styles/images/ss2.png) |
 
 ---
 
