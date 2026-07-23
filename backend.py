@@ -579,11 +579,13 @@ def generate_and_place_images(state: State) -> dict:
     # Collect generated image bytes for DB storage
     collected_images: list = []
 
+    evidence = state.get("evidence", [])
+
     # If no images requested, just write merged markdown
     if not image_specs:
         filename = f"{_safe_slug(plan.blog_title)}.md"
         Path(filename).write_text(md, encoding="utf-8")
-        _persist_to_db(user_id, plan, filename, md, collected_images)
+        _persist_to_db(user_id, plan, filename, md, collected_images, evidence)
         return {"final": md}
 
     images_dir = Path("images")
@@ -599,22 +601,42 @@ def generate_and_place_images(state: State) -> dict:
 
     slug = _safe_slug(plan.blog_title)
     Path(f"{slug}.md").write_text(md, encoding="utf-8")
-    _persist_to_db(user_id, plan, slug, md, collected_images)
+    _persist_to_db(user_id, plan, slug, md, collected_images, evidence)
     return {"final": md}
 
 
-def _persist_to_db(user_id: Optional[int], plan, slug: str, md: str, images: list):
+def _persist_to_db(user_id: Optional[int], plan, slug: str, md: str, images: list, evidence: list = None):
     """Save blog to PostgreSQL if user_id is available. Silently skips on any error."""
     if not user_id:
         return
     try:
+        import json
         from auth import save_blog
+
+        plan_dict = None
+        if hasattr(plan, "model_dump"):
+            plan_dict = plan.model_dump()
+        elif isinstance(plan, dict):
+            plan_dict = plan
+        plan_json = json.dumps(plan_dict, default=str) if plan_dict else None
+
+        evidence_list = []
+        if evidence:
+            for e in evidence:
+                if hasattr(e, "model_dump"):
+                    evidence_list.append(e.model_dump())
+                elif isinstance(e, dict):
+                    evidence_list.append(e)
+        evidence_json = json.dumps(evidence_list, default=str) if evidence_list else None
+
         save_blog(
             user_id=user_id,
-            title=plan.blog_title,
+            title=plan.blog_title if hasattr(plan, "blog_title") else str(plan),
             slug=slug,
             content=md,
             images=images,
+            plan_json=plan_json,
+            evidence_json=evidence_json,
         )
     except Exception:
         pass  # DB not configured or unavailable — continue without persisting

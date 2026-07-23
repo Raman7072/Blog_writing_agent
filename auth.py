@@ -85,8 +85,13 @@ def init_db():
                         title      VARCHAR(500) NOT NULL,
                         slug       VARCHAR(500) NOT NULL,
                         content    TEXT         NOT NULL,
+                        plan_json     TEXT,
+                        evidence_json TEXT,
                         created_at TIMESTAMP DEFAULT NOW()
                     );
+
+                    ALTER TABLE blogs ADD COLUMN IF NOT EXISTS plan_json TEXT;
+                    ALTER TABLE blogs ADD COLUMN IF NOT EXISTS evidence_json TEXT;
 
                     CREATE TABLE IF NOT EXISTS blog_images (
                         id         SERIAL PRIMARY KEY,
@@ -159,9 +164,9 @@ def login_user(email: str, password: str) -> "dict | None":
 # Blog Storage
 # ──────────────────────────────────────────────
 
-def save_blog(user_id: int, title: str, slug: str, content: str, images: list) -> int:
+def save_blog(user_id: int, title: str, slug: str, content: str, images: list, plan_json: Optional[str] = None, evidence_json: Optional[str] = None) -> int:
     """
-    Save blog + images to DB. Returns blog_id.
+    Save blog + images + plan/evidence to DB. Returns blog_id.
     images: list of {"filename": str, "data": bytes}
     """
     conn = get_conn()
@@ -169,8 +174,8 @@ def save_blog(user_id: int, title: str, slug: str, content: str, images: list) -
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO blogs (user_id, title, slug, content) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (user_id, title, slug, content),
+                    "INSERT INTO blogs (user_id, title, slug, content, plan_json, evidence_json) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                    (user_id, title, slug, content, plan_json, evidence_json),
                 )
                 blog_id = cur.fetchone()["id"]
                 for img in images:
@@ -203,7 +208,7 @@ def get_blog_content(blog_id: int, user_id: int) -> "dict | None":
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, title, slug, content FROM blogs WHERE id = %s AND user_id = %s",
+                "SELECT id, title, slug, content, plan_json, evidence_json FROM blogs WHERE id = %s AND user_id = %s",
                 (blog_id, user_id),
             )
             row = cur.fetchone()

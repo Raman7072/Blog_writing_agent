@@ -4,7 +4,7 @@ import json
 import os
 import re
 import zipfile
-from datetime import date
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Iterator, Tuple
@@ -119,11 +119,17 @@ def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
 
 def extract_latest_state(current_state: Dict[str, Any], step_payload: Any) -> Dict[str, Any]:
     if isinstance(step_payload, dict):
+        d = step_payload
         if len(step_payload) == 1 and isinstance(next(iter(step_payload.values())), dict):
-            inner = next(iter(step_payload.values()))
-            current_state.update(inner)
-        else:
-            current_state.update(step_payload)
+            d = next(iter(step_payload.values()))
+        
+        for k, v in d.items():
+            # Never overwrite existing non-empty state (like plan or evidence) with None or empty list
+            if v is None and current_state.get(k) is not None:
+                continue
+            if isinstance(v, list) and not v and current_state.get(k):
+                continue
+            current_state[k] = v
     return current_state
 
 
@@ -247,35 +253,71 @@ if _AUTH_AVAILABLE:
 # ── Cookie manager (must be initialised before any st.stop()) ────
 _cookie_manager = stx.CookieManager(key="graphloom_cm") if _COOKIES_AVAILABLE else None
 
-# Handle pending cookie deletion on logout
-if _COOKIES_AVAILABLE and _cookie_manager and st.session_state.get("logout_pending"):
+# Helper function to persist session across refreshes and domain environments
+def _set_user_session(user_dict: dict, page: str = "home"):
+    st.session_state["user"] = user_dict
+    st.session_state["logged_out"] = False
+    st.session_state["page"] = page
+    
+    token = create_session_token(user_dict)
+    st.query_params["session"] = token
+
+    if _COOKIES_AVAILABLE and _cookie_manager:
+        try:
+            exp_date = datetime.now() + timedelta(days=30)
+            _cookie_manager.set(
+                "graphloom_session",
+                token,
+                expires_at=exp_date,
+                max_age=30 * 24 * 3600,
+                same_site="lax",
+                key="login_cookie_set"
+            )
+            _cookie_manager.set(
+                "graphloom_page",
+                page,
+                expires_at=exp_date,
+                max_age=30 * 24 * 3600,
+                same_site="lax",
+                key="login_page_cookie_set"
+            )
+        except Exception:
+            pass
+
+# Handle pending cookie/query_param deletion on logout
+if st.session_state.get("logout_pending"):
     st.session_state.pop("logout_pending", None)
-    try:
-        _cookie_manager.delete("graphloom_session", key="logout_delete_cookie")
-        _cookie_manager.delete("graphloom_page", key="logout_delete_page_cookie")
-    except Exception:
-        pass
+    if "session" in st.query_params:
+        del st.query_params["session"]
+    if _COOKIES_AVAILABLE and _cookie_manager:
+        try:
+            _cookie_manager.delete("graphloom_session", key="logout_delete_cookie")
+            _cookie_manager.delete("graphloom_page", key="logout_delete_page_cookie")
+        except Exception:
+            pass
 
-# Auto-restore session from cookie on page load / refresh
-if _AUTH_AVAILABLE and _COOKIES_AVAILABLE and "user" not in st.session_state:
-    if not st.session_state.get("logged_out", False):
-        cookies = _cookie_manager.get_all()
-        _token = cookies.get("graphloom_session") if cookies else None
+# Auto-restore session on page load / refresh (URL query param first, cookie fallback second)
+if _AUTH_AVAILABLE and "user" not in st.session_state and not st.session_state.get("logged_out", False):
+    _token = st.query_params.get("session")
+    
+    if not _token and _COOKIES_AVAILABLE and _cookie_manager:
+        try:
+            cookies = _cookie_manager.get_all()
+            if cookies and isinstance(cookies, dict):
+                _token = cookies.get("graphloom_session")
+        except Exception:
+            pass
 
-        if _token:
-            _user_from_cookie = verify_session_token(str(_token))
-            if _user_from_cookie:
-                st.session_state["user"] = _user_from_cookie
-                st.session_state["page"] = cookies.get("graphloom_page", "home")
-                st.rerun()
-
-        # If cookies haven't been checked for this fresh browser session yet,
-        # render the loading screen and stop so the CookieManager iframe HTML/JS
-        # reaches the browser to send document.cookie back to Streamlit.
-        if not st.session_state.get("_cookie_checked", False):
-            st.session_state["_cookie_checked"] = True
-            show_loading_screen("RESTORING SESSION...", "Verifying authentication...")
-            st.stop()
+    if _token:
+        _user_from_token = verify_session_token(str(_token))
+        if _user_from_token:
+            st.session_state["user"] = _user_from_token
+            if "page" not in st.session_state:
+                st.session_state["page"] = "home"
+            st.query_params["session"] = str(_token)
+        else:
+            if "session" in st.query_params:
+                del st.query_params["session"]
 
 
 # ── Auth helpers ─────────────────────────────────────────────
@@ -490,22 +532,7 @@ if "login_pending" in st.session_state:
     try:
         user = login_user(pending["email"], pending["password"])
         if user:
-            st.session_state["user"] = user
-            st.session_state["logged_out"] = False
-            if _COOKIES_AVAILABLE and _cookie_manager:
-                _cookie_manager.set(
-                    "graphloom_session",
-                    create_session_token(user),
-                    max_age=30 * 24 * 3600,
-                    key="login_cookie_set"
-                )
-                _cookie_manager.set(
-                    "graphloom_page",
-                    "home",
-                    max_age=30 * 24 * 3600,
-                    key="login_page_cookie_set"
-                )
-            st.session_state["page"] = "home"
+            _set_user_session(user, "home")
         else:
             st.session_state["login_error"] = "Invalid email or password."
     except Exception as e:
@@ -518,22 +545,7 @@ if "register_pending" in st.session_state:
     try:
         result = register_user(pending["name"], pending["email"], pending["password"])
         if isinstance(result, dict):
-            st.session_state["user"] = result
-            st.session_state["logged_out"] = False
-            if _COOKIES_AVAILABLE and _cookie_manager:
-                _cookie_manager.set(
-                    "graphloom_session",
-                    create_session_token(result),
-                    max_age=30 * 24 * 3600,
-                    key="register_cookie_set"
-                )
-                _cookie_manager.set(
-                    "graphloom_page",
-                    "home",
-                    max_age=30 * 24 * 3600,
-                    key="register_page_cookie_set"
-                )
-            st.session_state["page"] = "home"
+            _set_user_session(result, "home")
         else:
             st.session_state["register_error"] = str(result)
     except Exception as e:
@@ -627,6 +639,8 @@ with st.sidebar:
             st.session_state.pop("profile_stats", None)
             st.session_state.pop("profile_blogs", None)
             st.session_state["cookie_checked"] = True
+            if "session" in st.query_params:
+                del st.query_params["session"]
             st.rerun()
 
     # ── Generate section ─────────────────────────────────
@@ -685,9 +699,13 @@ with st.sidebar:
                     _images_dir.mkdir(exist_ok=True)
                     for _img in _blog.get("images", []):
                         (_images_dir / _img["filename"]).write_bytes(_img["data"])
+                    
+                    _plan_obj = json.loads(_blog["plan_json"]) if _blog.get("plan_json") else None
+                    _evidence_obj = json.loads(_blog["evidence_json"]) if _blog.get("evidence_json") else []
+
                     st.session_state["last_out"] = {
-                        "plan": None,
-                        "evidence": [],
+                        "plan": _plan_obj,
+                        "evidence": _evidence_obj,
                         "image_specs": [{"filename": _img["filename"], "alt": "Loaded Image", "caption": _img["filename"]} for _img in _blog.get("images", [])],
                         "final": _blog["content"],
                     }
@@ -714,6 +732,75 @@ logs: List[str] = []
 
 def log(msg: str):
     logs.append(msg)
+
+
+def render_agent_telemetry(state: Dict[str, Any], active: bool = False):
+    """Renders the cybernetic agent core telemetry dashboard."""
+    _plan_val = state.get("plan")
+    _tasks_cnt = 0
+    if _plan_val:
+        if hasattr(_plan_val, "tasks"):
+            _tasks_cnt = len(_plan_val.tasks)
+        elif isinstance(_plan_val, dict):
+            _tasks_cnt = len(_plan_val.get("tasks", []))
+
+    mode_val = str(state.get("mode") or "HYBRID").upper()
+    needs_research_val = "YES" if state.get("needs_research") else "NO"
+    queries = state.get("queries") or []
+    queries_count = len(queries) if isinstance(queries, list) else 0
+    evidence = state.get("evidence") or []
+    evidence_count = len(evidence) if isinstance(evidence, list) else 0
+    sections = state.get("sections") or []
+    sections_done = len(sections) if isinstance(sections, list) else (_tasks_cnt if _tasks_cnt else 0)
+
+    badge_status = "STREAMING ACTIVE" if active else "EXECUTION COMPLETE"
+    badge_color = "#a5b4fc" if active else "#2dd4bf"
+
+    telemetry_html = f"""
+    <div style="
+        background: rgba(255, 255, 255, 0.02);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        padding: 1.5rem;
+        margin-top: 1rem;
+        margin-bottom: 1.5rem;
+        font-family: 'Courier',monospace;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2), inset 0 0 15px rgba(255, 255, 255, 0.01);
+        backdrop-filter: blur(20px);
+    ">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255, 255, 255, 0.06); padding-bottom: 0.6rem; margin-bottom: 1.2rem;">
+            <span style="color: #f5f5f5; font-weight: 600; font-size: 0.95rem; letter-spacing: 0.5px;">📡 AGENT CORE TELEMETRY</span>
+            <span style="color: {badge_color}; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.5px;">{badge_status}</span>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem;">
+            <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">EXECUTION MODE</span>
+                <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{mode_val}</span>
+            </div>
+            <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">RESEARCH ACTIVE</span>
+                <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{needs_research_val}</span>
+            </div>
+            <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">SEARCH QUERIES</span>
+                <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{queries_count}</span>
+            </div>
+            <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">EVIDENCE COUNT</span>
+                <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{evidence_count} items</span>
+            </div>
+            <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">PLAN TASKS</span>
+                <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{_tasks_cnt} tasks</span>
+            </div>
+            <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">SECTIONS WRITTEN</span>
+                <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{sections_done} sections</span>
+            </div>
+        </div>
+    </div>
+    """
+    st.markdown(telemetry_html, unsafe_allow_html=True)
 
 
 if run_btn:
@@ -754,84 +841,14 @@ if run_btn:
                 last_node = node_name
 
             current_state = extract_latest_state(current_state, payload)
-
-            _plan_val = current_state.get("plan")
-            _tasks_cnt = None
-            if _plan_val:
-                if hasattr(_plan_val, "tasks"):
-                    _tasks_cnt = len(_plan_val.tasks)
-                elif isinstance(_plan_val, dict):
-                    _tasks_cnt = len(_plan_val.get("tasks", []))
-
-            summary = {
-                "mode": current_state.get("mode"),
-                "needs_research": current_state.get("needs_research"),
-                "queries": current_state.get("queries", [])[:5] if isinstance(current_state.get("queries"), list) else [],
-                "evidence_count": len(current_state.get("evidence", []) or []),
-                "tasks": _tasks_cnt,
-                "images": len(current_state.get("image_specs", []) or []),
-                "sections_done": len(current_state.get("sections", []) or []),
-            }
-            
-            # Cybernetic dynamic telemetry dashboard
-            mode_val = str(summary.get("mode") or "INITIALIZING").upper()
-            needs_research_val = "YES" if summary.get("needs_research") else "NO"
-            queries_count = len(summary.get("queries") or [])
-            evidence_count = summary.get("evidence_count", 0)
-            tasks_count = summary.get("tasks") if summary.get("tasks") is not None else 0
-            images_count = summary.get("images", 0)
-            sections_done = summary.get("sections_done", 0)
-            
-            progress_html = f"""
-            <div style="
-                background: rgba(255, 255, 255, 0.02);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 14px;
-                padding: 1.5rem;
-                margin-top: 1rem;
-                font-family: 'Courier',monospace;
-                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2), inset 0 0 15px rgba(255, 255, 255, 0.01);
-                backdrop-filter: blur(20px);
-            ">
-                <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255, 255, 255, 0.06); padding-bottom: 0.6rem; margin-bottom: 1.2rem;">
-                    <span style="color: #f5f5f5; font-weight: 600; font-size: 0.95rem; letter-spacing: 0.5px;">📡 AGENT CORE TELEMETRY</span>
-                    <span style="color: #a5b4fc; font-size: 0.8rem; font-weight: 500;">STREAMING ACTIVE</span>
-                </div>
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem;">
-                    <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
-                        <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">EXECUTION MODE</span>
-                        <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{mode_val}</span>
-                    </div>
-                    <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
-                        <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">RESEARCH ACTIVE</span>
-                        <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{needs_research_val}</span>
-                    </div>
-                    <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
-                        <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">SEARCH QUERIES</span>
-                        <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{queries_count}</span>
-                    </div>
-                    <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
-                        <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">EVIDENCE COUNT</span>
-                        <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{evidence_count} items</span>
-                    </div>
-                    <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
-                        <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">PLAN TASKS</span>
-                        <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{tasks_count} tasks</span>
-                    </div>
-                    <div style="background: rgba(0, 0, 0, 0.15); padding: 0.8rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
-                        <span style="color: #94a3b8; font-size: 0.75rem; display: block; margin-bottom: 4px;">SECTIONS WRITTEN</span>
-                        <span style="color: #e2e8f0; font-size: 1.05rem; font-weight: 600;">{sections_done} sections</span>
-                    </div>
-                </div>
-            </div>
-            """
-            progress_area.markdown(progress_html, unsafe_allow_html=True)
+            with progress_area.container():
+                render_agent_telemetry(current_state, active=True)
 
             log(f"[{kind}] {json.dumps(payload, default=str)[:1200]}")
 
         elif kind == "final":
-            out = payload
-            st.session_state["last_out"] = out
+            current_state = extract_latest_state(current_state, payload)
+            st.session_state["last_out"] = current_state
             # Clear cached profile data so they fetch the newly created blog
             st.session_state.pop("profile_stats", None)
             st.session_state.pop("profile_blogs", None)
@@ -844,6 +861,28 @@ if run_btn:
 # Render last result (if any)
 out = st.session_state.get("last_out")
 if out:
+    st.markdown("""
+    <div style="
+        background: linear-gradient(135deg, rgba(45, 212, 191, 0.12) 0%, rgba(129, 140, 248, 0.12) 100%);
+        border: 1px solid rgba(45, 212, 191, 0.4);
+        border-radius: 12px;
+        padding: 1rem 1.5rem;
+        margin-top: 0.8rem;
+        margin-bottom: 1.2rem;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        box-shadow: 0 4px 20px rgba(45, 212, 191, 0.15);
+    ">
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <span style="font-size: 1.3rem;">✅</span>
+            <span style="color: #2dd4bf; font-weight: 700; font-family: 'Courier', monospace; font-size: 1.05rem; letter-spacing: 0.5px;">DONE — GRAPH EXECUTION COMPLETED</span>
+        </div>
+        <span style="color: #94a3b8; font-family: 'Courier', monospace; font-size: 0.82rem;">ALL NODES FINISHED & SAVED</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    render_agent_telemetry(out, active=False)
     specs = out.get("image_specs") or []
     allowed_filenames = {s["filename"] for s in specs if isinstance(s, dict) and "filename" in s}
     # --- Plan tab ---
@@ -868,20 +907,24 @@ if out:
 
             tasks = plan_dict.get("tasks", [])
             if tasks:
-                df = pd.DataFrame(
-                    [
-                        {
-                            "id": t.get("id"),
-                            "title": t.get("title"),
-                            "target_words": t.get("target_words"),
-                            "requires_research": t.get("requires_research"),
-                            "requires_citations": t.get("requires_citations"),
-                            "requires_code": t.get("requires_code"),
-                            "tags": ", ".join(t.get("tags") or []),
-                        }
-                        for t in tasks
-                    ]
-                ).sort_values("id")
+                task_rows = []
+                for t in tasks:
+                    if hasattr(t, "model_dump"):
+                        t_dict = t.model_dump()
+                    elif isinstance(t, dict):
+                        t_dict = t
+                    else:
+                        t_dict = json.loads(json.dumps(t, default=str))
+                    task_rows.append({
+                        "id": t_dict.get("id"),
+                        "title": t_dict.get("title"),
+                        "target_words": t_dict.get("target_words"),
+                        "requires_research": t_dict.get("requires_research"),
+                        "requires_citations": t_dict.get("requires_citations"),
+                        "requires_code": t_dict.get("requires_code"),
+                        "tags": ", ".join(t_dict.get("tags") or []),
+                    })
+                df = pd.DataFrame(task_rows).sort_values("id")
                 st.dataframe(df, width="stretch", hide_index=True)
 
                 with st.expander("Task details"):
@@ -897,13 +940,17 @@ if out:
             rows = []
             for e in evidence:
                 if hasattr(e, "model_dump"):
-                    e = e.model_dump()
+                    e_dict = e.model_dump()
+                elif isinstance(e, dict):
+                    e_dict = e
+                else:
+                    e_dict = json.loads(json.dumps(e, default=str))
                 rows.append(
                     {
-                        "title": e.get("title"),
-                        "published_at": e.get("published_at"),
-                        "source": e.get("source"),
-                        "url": e.get("url"),
+                        "title": e_dict.get("title"),
+                        "published_at": e_dict.get("published_at"),
+                        "source": e_dict.get("source"),
+                        "url": e_dict.get("url"),
                     }
                 )
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
