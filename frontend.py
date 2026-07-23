@@ -229,7 +229,7 @@ def extract_title_from_md(md: str, fallback: str) -> str:
 # -----------------------------
 st.set_page_config(
     page_title="GraphLoom",
-    page_icon="images/graphloom_favicon.png",
+    page_icon="styles/images/logo.png",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -583,7 +583,7 @@ import base64 as _b64
 
 @st.cache_data
 def _load_logo_b64() -> str:
-    _logo_path = Path("images/graphloom_logo.png")
+    _logo_path = Path("styles/images/graphloom_logo.png")
     if _logo_path.exists():
         with open(_logo_path, "rb") as _f:
             return _b64.b64encode(_f.read()).decode()
